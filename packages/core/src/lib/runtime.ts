@@ -1,18 +1,49 @@
-import type { ExecutionRequest, ExecutionSnapshot, TraceSpan, WorkflowStep } from '@pulsestack/contracts';
-import { executionRequestSchema, executionSnapshotSchema, traceSpanSchema } from '@pulsestack/contracts';
+import type {
+  ExecutionRequest,
+  ExecutionSnapshot,
+  RetryPolicy,
+  TraceSpan,
+  WorkflowStep,
+} from '@pulsestack/contracts';
+import {
+  executionRequestSchema,
+  executionSnapshotSchema,
+  traceSpanSchema,
+} from '@pulsestack/contracts';
 import { createEvent, publishEvent } from './events.js';
 import { createId } from './ids.js';
 import type { PulseInfra } from './infra.js';
+
+const defaultRetryPolicy: RetryPolicy = {
+  maxAttempts: 1,
+  backoffMs: 0,
+  maxBackoffMs: 30_000,
+  exponential: true,
+};
 
 type StepResult = {
   stepId: string;
   output: Record<string, unknown>;
   costUsd: number;
   tokens: number;
+  attempts: number;
+  retry: {
+    maxAttempts: number;
+    exhausted: boolean;
+    errors: string[];
+  };
+};
+
+type RuntimeOptions = {
+  sleep?: (ms: number) => Promise<void>;
 };
 
 export class WorkflowRuntime {
-  constructor(private readonly infra: PulseInfra, private readonly source = 'pulse-runtime') {}
+  constructor(
+    private readonly infra: PulseInfra,
+    private readonly source = 'pulse-runtime',
+    private readonly options: RuntimeOptions = {},
+  ) {}
 
   async execute(requestInput: ExecutionRequest) {
     const request = executionRequestSchema.parse(requestInput);
@@ -36,43 +67,91 @@ export class WorkflowRuntime {
         correlationId: request.workflow.correlationId,
         workflowId: request.workflow.id,
         executionId,
-        payload: { workflow: request.workflow.name, initiatedBy: request.initiatedBy },
+        payload: {
+          workflow: request.workflow.name,
+          initiatedBy: request.initiatedBy,
+        },
       }),
     );
 
     const state: Record<string, unknown> = { ...request.input };
+    const retryState: Record<string, unknown> = {};
     const results: StepResult[] = [];
 
-    for (const [index, step] of request.workflow.steps.entries()) {
-      const span = await this.startSpan({
-        traceId,
-        executionId,
-        workflowId: request.workflow.id,
-        step,
-        state,
-      });
+    try {
+      for (const [index, step] of request.workflow.steps.entries()) {
+        const span = await this.startSpan({
+          traceId,
+          executionId,
+          workflowId: request.workflow.id,
+          step,
+          state,
+        });
 
-      const result = await this.runStep(step, state, request.workflow.correlationId);
-      Object.assign(state, { [step.id]: result.output });
-      results.push(result);
+        let result: StepResult;
+        try {
+          result = await this.runStepWithRetry({
+            step,
+            state,
+            traceId,
+            executionId,
+            workflowId: request.workflow.id,
+            tenantId: request.workflow.tenantId,
+            correlationId: request.workflow.correlationId,
+            spanId: span.spanId,
+          });
+        } catch (error) {
+          if (error instanceof StepRetryExhaustedError) {
+            retryState[error.stepId] = error.retry;
+            Object.assign(state, { __retry: retryState });
+          }
+          await this.failSpan(span, error);
+          throw error;
+        }
+        retryState[step.id] = result.retry;
+        Object.assign(state, { [step.id]: result.output, __retry: retryState });
+        results.push(result);
 
-      await this.snapshot({
-        id: createId('snap'),
-        executionId,
-        workflowId: request.workflow.id,
-        sequence: index,
-        state: structuredClone(state),
-        sideEffects: [
-          {
-            type: step.kind,
-            key: step.id,
-            response: result.output,
-          },
-        ],
-        createdAt: new Date().toISOString(),
-      });
+        await this.snapshot({
+          id: createId('snap'),
+          executionId,
+          workflowId: request.workflow.id,
+          sequence: index,
+          state: structuredClone(state),
+          sideEffects: [
+            {
+              type: step.kind,
+              key: step.id,
+              response: result.output,
+            },
+          ],
+          createdAt: new Date().toISOString(),
+        });
 
-      await this.finishSpan(span, result);
+        await this.finishSpan(span, result);
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Workflow step failed';
+      const failureOutput = {
+        steps: results,
+        finalState: state,
+        error: message,
+      };
+      await this.infra.completeExecution(executionId, 'failed', failureOutput);
+      await publishEvent(
+        this.infra,
+        createEvent({
+          type: 'workflow.failed',
+          source: this.source,
+          tenantId: request.workflow.tenantId,
+          correlationId: request.workflow.correlationId,
+          workflowId: request.workflow.id,
+          executionId,
+          payload: failureOutput,
+        }),
+      );
+      throw error;
     }
 
     const output = {
@@ -99,8 +178,94 @@ export class WorkflowRuntime {
     return { executionId, traceId, output };
   }
 
-  private async runStep(step: WorkflowStep, state: Record<string, unknown>, correlationId: string): Promise<StepResult> {
+  private async runStepWithRetry(args: {
+    step: WorkflowStep;
+    state: Record<string, unknown>;
+    traceId: string;
+    executionId: string;
+    workflowId: string;
+    tenantId: string;
+    correlationId: string;
+    spanId: string;
+  }): Promise<StepResult> {
+    const policy = normalizeRetryPolicy(args.step.retry);
+    const errors: string[] = [];
+
+    for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
+      try {
+        const result = await this.runStep(
+          args.step,
+          args.state,
+          args.correlationId,
+          attempt,
+        );
+        return {
+          ...result,
+          attempts: attempt,
+          retry: {
+            maxAttempts: policy.maxAttempts,
+            exhausted: false,
+            errors,
+          },
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Step failed';
+        errors.push(message);
+        const nextDelayMs = getRetryDelayMs(policy, attempt);
+        const canRetry = attempt < policy.maxAttempts;
+        await publishEvent(
+          this.infra,
+          createEvent({
+            type: canRetry ? 'step.retrying' : 'step.failed',
+            source: this.source,
+            tenantId: args.tenantId,
+            correlationId: args.correlationId,
+            workflowId: args.workflowId,
+            executionId: args.executionId,
+            spanId: args.spanId,
+            payload: {
+              stepId: args.step.id,
+              stepName: args.step.name,
+              attempt,
+              maxAttempts: policy.maxAttempts,
+              nextDelayMs: canRetry ? nextDelayMs : 0,
+              error: message,
+            },
+            tags: {
+              stepKind: args.step.kind,
+              traceId: args.traceId,
+            },
+          }),
+        );
+        if (!canRetry) {
+          throw new StepRetryExhaustedError(
+            args.step.id,
+            {
+              maxAttempts: policy.maxAttempts,
+              exhausted: true,
+              errors,
+            },
+            `Step ${args.step.id} failed after ${policy.maxAttempts} attempt${policy.maxAttempts === 1 ? '' : 's'}: ${message}`,
+          );
+        }
+        await this.sleep(nextDelayMs);
+      }
+    }
+
+    throw new Error(`Step ${args.step.id} failed without producing a result`);
+  }
+
+  private async runStep(
+    step: WorkflowStep,
+    state: Record<string, unknown>,
+    correlationId: string,
+    attempt: number,
+  ): Promise<Omit<StepResult, 'attempts' | 'retry'>> {
     const timestamp = new Date().toISOString();
+    const plannedFailures = Number(step.input.failAttempts ?? 0);
+    if (Number.isFinite(plannedFailures) && attempt <= plannedFailures) {
+      throw new Error(`Simulated failure for ${step.id} on attempt ${attempt}`);
+    }
     if (step.kind === 'tool') {
       await publishEvent(
         this.infra,
@@ -109,7 +274,12 @@ export class WorkflowRuntime {
           source: this.source,
           tenantId: 'local',
           correlationId,
-          payload: { stepId: step.id, tool: step.name, input: step.input, state },
+          payload: {
+            stepId: step.id,
+            tool: step.name,
+            input: step.input,
+            state,
+          },
         }),
       );
     }
@@ -121,7 +291,11 @@ export class WorkflowRuntime {
           source: this.source,
           tenantId: 'local',
           correlationId,
-          payload: { stepId: step.id, model: step.input.model ?? 'generic', prompt: step.input.prompt ?? '' },
+          payload: {
+            stepId: step.id,
+            model: step.input.model ?? 'generic',
+            prompt: step.input.prompt ?? '',
+          },
         }),
       );
     }
@@ -142,13 +316,17 @@ export class WorkflowRuntime {
           ? {
               ...base,
               status: 'ok',
-              result: { echoed: step.input, checksum: `${step.id}:${Object.keys(state).length}` },
+              result: {
+                echoed: step.input,
+                checksum: `${step.id}:${Object.keys(state).length}`,
+              },
             }
           : {
               ...base,
               status: 'processed',
             };
-    const tokens = step.kind === 'llm' && 'tokens' in output ? Number(output.tokens) : 0;
+    const tokens =
+      step.kind === 'llm' && 'tokens' in output ? Number(output.tokens) : 0;
 
     return {
       stepId: step.id,
@@ -176,7 +354,11 @@ export class WorkflowRuntime {
       status: 'running',
       startedAt: new Date().toISOString(),
       endedAt: null,
-      attributes: { dependsOn: args.step.dependsOn, stateKeys: Object.keys(args.state) },
+      attributes: {
+        dependsOn: args.step.dependsOn,
+        stateKeys: Object.keys(args.state),
+        retryMaxAttempts: normalizeRetryPolicy(args.step.retry).maxAttempts,
+      },
       error: null,
     });
     await this.infra.writeSpan(span);
@@ -201,12 +383,65 @@ export class WorkflowRuntime {
       ...span,
       status: 'ok',
       endedAt: new Date().toISOString(),
-      attributes: { ...span.attributes, stepId: result.stepId, costUsd: result.costUsd, tokens: result.tokens },
+      attributes: {
+        ...span.attributes,
+        stepId: result.stepId,
+        costUsd: result.costUsd,
+        tokens: result.tokens,
+        attempts: result.attempts,
+        retryExhausted: result.retry.exhausted,
+      },
+    });
+  }
+
+  private async failSpan(span: TraceSpan, error: unknown) {
+    const message = error instanceof Error ? error.message : 'Step failed';
+    await this.infra.writeSpan({
+      ...span,
+      status: 'error',
+      endedAt: new Date().toISOString(),
+      attributes: { ...span.attributes, retryExhausted: true },
+      error: message,
     });
   }
 
   private async snapshot(snapshotInput: ExecutionSnapshot) {
     const snapshot = executionSnapshotSchema.parse(snapshotInput);
     await this.infra.writeSnapshot(snapshot);
+  }
+
+  private async sleep(ms: number) {
+    if (ms <= 0) return;
+    await (this.options.sleep ?? defaultSleep)(ms);
+  }
+}
+
+function normalizeRetryPolicy(policy?: RetryPolicy): RetryPolicy {
+  return {
+    ...defaultRetryPolicy,
+    ...policy,
+  };
+}
+
+function getRetryDelayMs(policy: RetryPolicy, failedAttempt: number) {
+  if (policy.backoffMs <= 0) return 0;
+  const multiplier = policy.exponential
+    ? 2 ** Math.max(0, failedAttempt - 1)
+    : 1;
+  return Math.min(policy.backoffMs * multiplier, policy.maxBackoffMs);
+}
+
+async function defaultSleep(ms: number) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+class StepRetryExhaustedError extends Error {
+  constructor(
+    readonly stepId: string,
+    readonly retry: StepResult['retry'],
+    message: string,
+  ) {
+    super(message);
+    this.name = 'StepRetryExhaustedError';
   }
 }
