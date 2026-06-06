@@ -78,10 +78,6 @@ export class WorkflowRuntime {
           input: request.input,
         });
 
-        const state: Record<string, unknown> = { ...request.input };
-        const retryState: Record<string, unknown> = {};
-        const results: StepResult[] = [];
-
         await publishEvent(
           this.infra,
           createEvent({
@@ -98,6 +94,11 @@ export class WorkflowRuntime {
             },
           }),
         );
+
+
+        const state: Record<string, unknown> = { ...request.input };
+        const retryState: Record<string, unknown> = {};
+        const results: StepResult[] = [];
 
         try {
           for (const [index, step] of request.workflow.steps.entries()) {
@@ -333,6 +334,7 @@ export class WorkflowRuntime {
   private async runStep(
     step: WorkflowStep,
     state: Record<string, unknown>,
+
     tenantId: string,
     correlationId: string,
     attempt: number,
