@@ -334,7 +334,6 @@ export class WorkflowRuntime {
   private async runStep(
     step: WorkflowStep,
     state: Record<string, unknown>,
-
     tenantId: string,
     correlationId: string,
     attempt: number,
