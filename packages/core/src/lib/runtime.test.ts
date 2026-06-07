@@ -1,6 +1,14 @@
-
 import { describe, expect, it } from 'vitest';
+import type {
+  EventEnvelope,
+  WorkflowDefinition,
+  ExecutionSnapshot,
+  TraceSpan,
+} from '@pulsestack/contracts';
+import type { PulseInfra } from './infra.js';
+
 import type { EventEnvelope, WorkflowDefinition, ExecutionSnapshot, TraceSpan } from '@pulsestack/contracts';
+
 import { WorkflowRuntime } from './runtime.js';
 import type { PulseInfra } from './infra.js';
 
@@ -192,6 +200,5 @@ describe('WorkflowRuntime retry handling', () => {
           'Step fetch_logs failed after 2 attempts: Simulated failure for fetch_logs on attempt 2',
       },
     });
-
   });
 });
